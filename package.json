@@ -1,0 +1,35 @@
+{
+  "name": "codex-mcp-server",
+  "version": "1.0.0",
+  "description": "Model Context Protocol server that exposes Codex CLI as a recursive tool",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node bin/codex-mcp-server.js --stdio",
+    "server:dev": "node src/server/index.js",
+    "orchestrator:dev": "node src/server/index.js",
+    "frontend:dev": "npm run dev --prefix frontend",
+    "dev": "concurrently \"npm run server:dev\" \"npm run frontend:dev\"",
+    "build:frontend": "npm run build --prefix frontend"
+  },
+  "keywords": [
+    "codex",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.2",
+    "cors": "^2.8.5",
+    "cross-spawn": "^7.0.6",
+    "express": "^4.19.2",
+    "uuid": "^9.0.1",
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "nodemon": "^3.1.4"
+  }
+}
