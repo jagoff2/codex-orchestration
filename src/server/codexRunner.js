@@ -25,6 +25,47 @@ export class CodexRunner extends EventEmitter {
     this.execArgs = Array.isArray(options.execArgs)
       ? [...options.execArgs]
       : [...config.execArgs];
+    this.activeChild = null;
+  }
+
+  async ensureInactive() {
+    const child = this.activeChild;
+    if (!child) {
+      return;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      if (this.activeChild === child) {
+        this.activeChild = null;
+      }
+      return;
+    }
+    await new Promise((resolve) => {
+      let resolved = false;
+      const cleanup = () => {
+        if (resolved) return;
+        resolved = true;
+        if (this.activeChild === child) {
+          this.activeChild = null;
+        }
+        resolve();
+      };
+      child.once('exit', cleanup);
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        /* ignore */
+      }
+      setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* ignore */
+          }
+        }
+      }, 200).unref();
+      setTimeout(cleanup, 1000).unref();
+    });
   }
 
   async runOnce({
@@ -67,6 +108,7 @@ export class CodexRunner extends EventEmitter {
       env: { ...process.env, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    this.activeChild = child;
 
     const rl = createInterface({
       input: child.stdout,
@@ -177,6 +219,9 @@ export class CodexRunner extends EventEmitter {
       }, timeoutMs).unref();
 
     const [code, signal] = await once(child, 'exit');
+    if (this.activeChild === child) {
+      this.activeChild = null;
+    }
 
     if (timer) {
       clearTimeout(timer);

@@ -5,6 +5,9 @@ import { CodexRunner } from './codexRunner.js';
 import { config, debugLog } from './config.js';
 import { sanitizePrompt } from '../promptUtils.js';
 
+const MAX_PLAN_ATTEMPTS = Number(process.env.CODEX_ORCHESTRATOR_MAX_PLAN_ATTEMPTS ?? 4);
+const MAX_AGENT_ATTEMPTS = Number(process.env.CODEX_ORCHESTRATOR_MAX_AGENT_ATTEMPTS ?? 3);
+
 function safeJsonParse(payload) {
   if (!payload || typeof payload !== 'string') return null;
   const trimmed = payload.trim();
@@ -28,7 +31,7 @@ function safeJsonParse(payload) {
   }
 }
 
-function buildMissionPlanPrompt(goal, context, { emphasis = 'standard' } = {}) {
+function buildMissionPlanPrompt(goal, context, { emphasis = 'standard', failureReason = null } = {}) {
   const header = config.orchestrator.planningPrompt;
   const lines = [
     header,
@@ -39,6 +42,18 @@ function buildMissionPlanPrompt(goal, context, { emphasis = 'standard' } = {}) {
   if (context) {
     lines.push('', 'Additional context:', typeof context === 'string' ? context : JSON.stringify(context, null, 2));
   }
+  if (failureReason) {
+    lines.push(
+      '',
+      'Previous attempt failed because:',
+      typeof failureReason === 'string' ? failureReason : JSON.stringify(failureReason, null, 2),
+      'Correct the issue explicitly before returning the plan.',
+    );
+  }
+  // Platform hint for planner – tells LLM which shell syntax to use.
+  const platform = process.platform;
+  const osHint = platform === 'win32' ? 'Windows (use PowerShell commands)' : `${platform} (use Bash commands)`;
+  lines.push('', `Host OS: ${osHint}. Emit shell commands using the native syntax.`);
   lines.push(
     '',
     'Agent schema (must include every field):',
@@ -51,9 +66,11 @@ function buildMissionPlanPrompt(goal, context, { emphasis = 'standard' } = {}) {
     'Directives:',
     '1. Mission details are complete. DO NOT ask clarifying questions.',
     '2. Output STRICT JSON only (no prose, no code fences).',
-    '3. Provide 2-4 highly specialized agents tailored to the mission.',
+    '3. Provide 2-6 highly specialized agents tailored to the mission.',
     '4. Agents must be complementary and cover the full delivery loop (planning/design, implementation, testing/QA, validation/documentation) unless the mission explicitly omits a phase.',
     '5. Do not assign multiple agents to the same task; instead, create sequential hand-offs that mirror a real engineering team.',
+    '6. Every agent must describe only actions they genuinely perform (commands run, files touched, tests executed). Fabricated or purely hypothetical work is forbidden—agents must verify artifacts before reporting success.',
+    '7. The planner MUST NOT write code, shell commands, or pseudo-implementations. Its sole responsibility is to emit JSON that describes the mission summary and agent plan—no Markdown, code blocks, or instructions beyond the schema.',
     '',
     'JSON schema sample:',
     '{"mission_summary":"...","agents":[{"name":"...","role":"...","expertise":"...","objective":"...","instructions":"..."}]}',
@@ -85,7 +102,22 @@ function needsTimeoutDirective(agent) {
   );
 }
 
-function buildAgentPrompt(mission, agent) {
+function buildAgentPrompt(mission, agent, { attempt = 0, failureReason = null } = {}) {
+  const retryBlock =
+    failureReason && `${failureReason}`.trim().length
+      ? `Attempt ${attempt + 1} corrective directives:
+- Previous attempt failed because: ${failureReason}
+- Resolve this issue explicitly before proceeding.
+- Show evidence (command outputs, file diffs, test logs) proving the fix.
+
+`
+      : '';
+  const realityBlock = `Reality-check requirement:
+- Only describe actions you actually performed during this turn (commands executed, files created/edited, tests run). Do NOT speculate or invent results.
+- After each modification, cite the exact command used (e.g., \`ls\`, \`cat file\`, \`npm test --timeout 60\`) and summarize the observed output, or explicitly state why the action could not be performed.
+- If a requested artifact does not exist or you lack permissions/resources, declare the blocker and request an iteration instead of fabricating work.
+
+`;
   const timeoutBlock = needsTimeoutDirective(agent)
     ? `Testing safety requirement:
 - Every command, script, or test you run MUST include an explicit, realistic timeout. Choose a duration appropriate for the workload (typically 30-180 seconds). If the tool lacks a timeout flag, wrap it with a timeout utility (e.g., PowerShell Start-Process with -Wait -Timeout, bash "timeout" command, or equivalent).
@@ -101,7 +133,7 @@ Core expertise: ${agent.expertise}
 Instructions:
 ${agent.instructions}
 
-${timeoutBlock}Deliver a comprehensive result in Markdown. Include reasoning, key decisions, and final outputs.
+${retryBlock}${realityBlock}${timeoutBlock}Deliver a comprehensive result in Markdown. Include reasoning, key decisions, and final outputs.
 
 Iteration protocol:
 - If additional work is required before the mission can proceed (e.g., tests failed, missing docs), end your response with a single line exactly like:
@@ -178,21 +210,50 @@ export class Orchestrator extends EventEmitter {
 
   async #planMission(mission) {
     this.emit('mission:planning', { missionId: mission.id });
-    const initialPrompt = buildMissionPlanPrompt(mission.goal, mission.context, { emphasis: 'standard' });
-    let attempt = await this.#attemptPlan(mission, initialPrompt, 'initial');
+    let failureReason = null;
+    let lastAttempt = null;
 
-    if (!attempt.plan) {
-      const retryPrompt = buildMissionPlanPrompt(mission.goal, mission.context, { emphasis: 'retry' });
-      attempt = await this.#attemptPlan(mission, retryPrompt, 'retry');
-      if (!attempt.plan) {
-        throw new Error(
-          `Failed to parse mission plan after two attempts. Snippet: ${attempt.preview ?? '[none]'}`,
-        );
+    for (let attemptIndex = 0; attemptIndex < MAX_PLAN_ATTEMPTS; attemptIndex += 1) {
+      const emphasis = attemptIndex === 0 ? 'standard' : 'retry';
+      if (attemptIndex > 0) {
+        await this.runner.ensureInactive();
       }
+      const prompt = buildMissionPlanPrompt(mission.goal, mission.context, {
+        emphasis,
+        failureReason,
+      });
+      const label = attemptIndex === 0 ? 'initial' : `retry-${attemptIndex}`;
+      try {
+        lastAttempt = await this.#attemptPlan(mission, prompt, label);
+      } catch (error) {
+        failureReason = `Codex planner error: ${error.message}`;
+        mission.logs.push({
+          type: `plan:${label}:failure`,
+          at: new Date().toISOString(),
+          reason: failureReason,
+        });
+        debugLog('Plan attempt threw error', { label, failureReason });
+        continue;
+      }
+      if (lastAttempt.plan) {
+        this.#applyPlanResult(mission, lastAttempt.plan, lastAttempt.planResult);
+        this.emit('mission:planned', { missionId: mission.id, mission });
+        return;
+      }
+      failureReason = this.#describePlanFailure(lastAttempt);
+      mission.logs.push({
+        type: `plan:${label}:failure`,
+        at: new Date().toISOString(),
+        reason: failureReason,
+      });
+      debugLog('Plan attempt failed', { label, failureReason });
     }
 
-    this.#applyPlanResult(mission, attempt.plan, attempt.planResult);
-    this.emit('mission:planned', { missionId: mission.id, mission });
+    const summary =
+      failureReason ?? 'Unknown planner failure (no candidates produced after retries).';
+    throw new Error(
+      `Failed to obtain mission plan after ${MAX_PLAN_ATTEMPTS} attempts. Last issue: ${summary}`,
+    );
   }
 
   async #attemptPlan(mission, prompt, label) {
@@ -267,6 +328,26 @@ export class Orchestrator extends EventEmitter {
     return { plan: null, preview: candidates[0]?.slice(0, 400) };
   }
 
+  #describePlanFailure(attempt) {
+    if (!attempt?.planResult) {
+      return 'Planner invocation returned no result.';
+    }
+    const { planResult, preview } = attempt;
+    if (planResult.exitCode !== null && planResult.exitCode !== 0) {
+      return this.#composeFailureReason(
+        `Codex exited with code ${planResult.exitCode}`,
+        planResult,
+      );
+    }
+    if (!preview) {
+      const stdoutSnippet = planResult.stdout
+        ? planResult.stdout.slice(0, 200)
+        : '[no stdout]';
+      return `Planner response lacked valid JSON. Stdout snippet: ${stdoutSnippet}`;
+    }
+    return `Planner response was not valid JSON. Preview: ${preview.slice(0, 200)}`;
+  }
+
   #applyPlanResult(mission, parsed, planResult) {
     mission.summary = parsed.mission_summary ?? parsed.summary ?? null;
     mission.agentBlueprints = mission.agentBlueprints ?? Object.create(null);
@@ -311,53 +392,129 @@ export class Orchestrator extends EventEmitter {
       }
 
       agent.status = 'running';
-      agent.startedAt = new Date().toISOString();
+      if (!agent.startedAt) {
+        agent.startedAt = new Date().toISOString();
+      }
       this.emit('agent:started', { missionId: mission.id, agent });
 
-      const agentPrompt = buildAgentPrompt(mission, agent);
-      const result = await this.runner.runOnce({
-        prompt: agentPrompt,
-        extraArgs: [],
-      });
+      let attemptIndex = 0;
+      let failureReason = null;
+      let insertedAgents = 0;
+      let success = false;
+      let lastResult = null;
 
-      agent.logs.push({
-        type: 'interaction',
-        at: new Date().toISOString(),
-        data: result,
-      });
-      agent.status = result.exitCode === 0 ? 'completed' : 'failed';
-      agent.completedAt = new Date().toISOString();
-      agent.sessionId = result.sessionId ?? result.threadId ?? null;
-      agent.result = {
-        summary: result.lastAgentMessage ?? null,
-        usage: result.usage ?? null,
-        completion: result.completion,
-        command: result.command ?? null,
-      };
+      while (attemptIndex < MAX_AGENT_ATTEMPTS) {
+        if (attemptIndex > 0) {
+          await this.runner.ensureInactive();
+        }
+        const agentPrompt = buildAgentPrompt(mission, agent, {
+          attempt: attemptIndex,
+          failureReason,
+        });
+        let result;
+        try {
+          result = await this.runner.runOnce({
+            prompt: agentPrompt,
+            extraArgs: [],
+          });
+        } catch (error) {
+          failureReason = `Codex runner error: ${error.message}`;
+          agent.logs.push({
+            type: 'interaction:error',
+            at: new Date().toISOString(),
+            data: { error: error.message },
+          });
+          attemptIndex += 1;
+          continue;
+        }
+        lastResult = result;
 
-      mission.results.push({
-        agentId: agent.id,
-        output: agent.result,
-      });
+        agent.logs.push({
+          type: 'interaction',
+          at: new Date().toISOString(),
+          data: result,
+        });
 
-      mission.updatedAt = new Date().toISOString();
-      this.emit('agent:finished', { missionId: mission.id, agent });
+        if (result.exitCode !== 0) {
+          failureReason = this.#composeFailureReason(
+            `Codex exited with code ${result.exitCode}`,
+            result,
+          );
+          attemptIndex += 1;
+          continue;
+        }
 
-      if (agent.status === 'failed') {
+        const directiveSource =
+          result.lastAgentMessage ?? agent.result?.summary ?? result.stdout ?? '';
+        const controlDirective = this.#extractControlDirective(directiveSource);
+        if (!controlDirective) {
+          failureReason = 'CONTROL_JSON directive missing or invalid';
+          attemptIndex += 1;
+          continue;
+        }
+
+        const hadExecutionErrors = this.#resultHasExecutionErrors(result);
+        const directiveOutcome = this.#handleControlDirective(
+          mission,
+          agent,
+          controlDirective,
+          idx,
+          { hadExecutionErrors },
+        );
+        if (!directiveOutcome.ok) {
+          failureReason = directiveOutcome.reason;
+          attemptIndex += 1;
+          continue;
+        }
+
+        agent.completedAt = new Date().toISOString();
+        agent.sessionId = result.sessionId ?? result.threadId ?? null;
+        agent.result = {
+          summary: result.lastAgentMessage ?? null,
+          usage: result.usage ?? null,
+          completion: result.completion,
+          command: result.command ?? null,
+        };
+        agent.status = 'completed';
+        mission.results.push({
+          agentId: agent.id,
+          output: agent.result,
+        });
+        mission.updatedAt = new Date().toISOString();
+        this.emit('agent:finished', { missionId: mission.id, agent });
+
+        insertedAgents = directiveOutcome.inserted ?? 0;
+        success = true;
+        break;
+      }
+
+      if (!success) {
+        const finalReason = failureReason ?? 'Unknown agent failure';
+        agent.status = 'failed';
+        agent.completedAt = new Date().toISOString();
+        if (!agent.result && lastResult) {
+          agent.result = {
+            summary: lastResult.lastAgentMessage ?? null,
+            usage: lastResult.usage ?? null,
+            completion: lastResult.completion,
+            command: lastResult.command ?? null,
+          };
+        }
         mission.status = 'failed';
-        mission.error = `Agent ${agent.name} failed`;
+        mission.error = `Agent ${agent.name} exhausted retries: ${finalReason}`;
+        mission.updatedAt = new Date().toISOString();
+        mission.logs.push({
+          type: 'agent:failure',
+          at: new Date().toISOString(),
+          agent: agent.name,
+          reason: finalReason,
+        });
         this.emit('mission:failed', { mission, error: new Error(mission.error) });
         return;
       }
 
-      const directiveSource =
-        agent.result?.summary ?? result.lastAgentMessage ?? result.stdout ?? '';
-      const controlDirective = this.#extractControlDirective(directiveSource);
-      if (controlDirective) {
-        const inserted = this.#handleControlDirective(mission, agent, controlDirective, idx);
-        if (inserted > 0) {
-          continue;
-        }
+      if (insertedAgents > 0) {
+        continue;
       }
     }
   }
@@ -383,15 +540,29 @@ export class Orchestrator extends EventEmitter {
     return null;
   }
 
-  #handleControlDirective(mission, requestingAgent, directive, insertIndex) {
+  #handleControlDirective(mission, requestingAgent, directive, insertIndex, options = {}) {
+    const { hadExecutionErrors = false } = options;
     if (!directive || typeof directive !== 'object') {
-      return 0;
+      return { ok: false, inserted: 0, reason: 'Malformed CONTROL_JSON directive' };
     }
     const action = `${directive.action ?? directive.status ?? ''}`.toLowerCase();
-    if (action === 'request_iteration') {
-      return this.#enqueueIterationAgents(mission, requestingAgent, directive, insertIndex);
+    if (!action) {
+      return { ok: false, inserted: 0, reason: 'CONTROL_JSON missing action' };
     }
-    return 0;
+    if (action === 'continue') {
+      if (hadExecutionErrors) {
+        return { ok: false, inserted: 0, reason: 'Execution errors detected; cannot continue' };
+      }
+      return { ok: true, inserted: 0 };
+    }
+    if (action === 'request_iteration') {
+      const inserted = this.#enqueueIterationAgents(mission, requestingAgent, directive, insertIndex);
+      if (inserted === 0) {
+        return { ok: false, inserted: 0, reason: 'Iteration request could not be fulfilled' };
+      }
+      return { ok: true, inserted };
+    }
+    return { ok: false, inserted: 0, reason: `Unsupported CONTROL_JSON action: ${action}` };
   }
 
   #enqueueIterationAgents(mission, requestingAgent, directive, insertIndex) {
@@ -475,6 +646,67 @@ export class Orchestrator extends EventEmitter {
       });
     }
     return newAgents.length;
+  }
+
+  #composeFailureReason(reason, result) {
+    if (!result) {
+      return reason;
+    }
+    const stderrSnippet = result.stderr
+      ? result.stderr.replace(/\s+/g, ' ').trim().slice(0, 200)
+      : null;
+    if (stderrSnippet) {
+      return `${reason}. stderr: ${stderrSnippet}`;
+    }
+    if (Array.isArray(result.events)) {
+      const errorEvent = result.events.find(
+        (event) =>
+          event?.type === 'error'
+          || event?.type === 'exception'
+          || event?.error
+          || event?.item?.error,
+      );
+      if (errorEvent) {
+        return `${reason}. Event error: ${JSON.stringify(errorEvent).slice(0, 200)}`;
+      }
+    }
+    const stdoutSnippet = result.stdout
+      ? result.stdout.replace(/\s+/g, ' ').trim().slice(0, 200)
+      : null;
+    return stdoutSnippet ? `${reason}. stdout: ${stdoutSnippet}` : reason;
+  }
+
+  #resultHasExecutionErrors(result) {
+    if (!result) {
+      return false;
+    }
+    if (Array.isArray(result.events)) {
+      for (const event of result.events) {
+        if (event?.type === 'error' || event?.type === 'exception') {
+          return true;
+        }
+        if (event?.type === 'item.completed') {
+          if (
+            (event.status && event.status !== 'success')
+            || (event.item?.status && event.item.status !== 'success')
+            || event.error
+            || event.item?.error
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    const stderr = `${result.stderr ?? ''}`.toLowerCase();
+    if (!stderr) {
+      return false;
+    }
+    return (
+      stderr.includes('error: enoent')
+      || stderr.includes('error: eacces')
+      || stderr.includes('permission denied')
+      || stderr.includes('error catch error')
+    );
   }
 
   #getAgentBlueprint(mission, baseName) {

@@ -26,7 +26,7 @@ export const config = {
   debug: debugEnabled,
   orchestrator: {
     planningPrompt: process.env.CODEX_ORCHESTRATOR_PLANNING_PROMPT
-      ?? 'You are Codex Mission Control. Return a JSON plan with keys "mission_summary" and "agents". Do not output any other text.',
+      ?? 'You are Codex Mission Control. Return a JSON plan with keys "mission_summary" and "agents". Do not output any other text. NEVER output code.',
   },
   server: {
     port: Number(process.env.PORT || 4300),
