@@ -675,6 +675,7 @@ export class Orchestrator extends EventEmitter {
       overrideInstructions,
       triggeredBy: requestingAgent.name,
       reason,
+      resumeFromAgent: requestingAgent,
     });
     if (iterationAgent) {
       newAgents.push(iterationAgent);
@@ -696,8 +697,7 @@ export class Orchestrator extends EventEmitter {
         const followUpAgent = this.#cloneAgentForIteration(followUpBlueprint, mission, {
           overrideInstructions: followUpOverride,
           triggeredBy: requestingAgent.name,
-          reason: 'follow_up_verification',
-        });
+          reason: 'follow_up_verification',resumeFromAgent: requestingAgent});
         if (followUpAgent) {
           newAgents.push(followUpAgent);
         }
@@ -806,7 +806,7 @@ export class Orchestrator extends EventEmitter {
     return mission.agentBlueprints[baseName?.replace(/__iter\d+$/, '')] ?? null;
   }
 
-  #cloneAgentForIteration(blueprint, mission, { overrideInstructions, triggeredBy, reason } = {}) {
+  #cloneAgentForIteration(blueprint, mission, { overrideInstructions, triggeredBy, reason, resumeFromAgent  } = {}) {
     if (!blueprint || !mission?.agents) return null;
     const existingCount = mission.agents.filter((agent) => agent.baseName === blueprint.name).length;
     const iterationIndex = existingCount;
@@ -828,7 +828,7 @@ export class Orchestrator extends EventEmitter {
       instructions: combinedInstructions,
       status: 'pending',
       result: null,
-      sessionId: null,
+      sessionId: (resumeFromAgent && resumeFromAgent.sessionId && (resumeFromAgent.baseName === blueprint.name || resumeFromAgent.name === blueprint.name)) ? resumeFromAgent.sessionId : null,
       logs: [],
       triggeredBy: triggeredBy ?? null,
       iterationReason: reason ?? null,
@@ -932,8 +932,9 @@ Return nothing else.`
       const triageResult = await this.runner.runOnce({
         prompt: triagePrompt,
         extraArgs: [],
-        threadId: failedAgent.sessionId ?? undefined,
-        sessionId: failedAgent.sessionId ?? undefined,
+        // Run triage in an isolated thread so it does NOT alter the failed agent’s context.
+        threadId: undefined,
+        sessionId: undefined,
       });
       // We "kill" the temp sub-agent by not inserting it into mission.agents.
       const text =
