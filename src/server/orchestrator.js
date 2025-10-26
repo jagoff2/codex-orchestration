@@ -50,7 +50,6 @@ function buildMissionPlanPrompt(goal, context, { emphasis = 'standard', failureR
       'Correct the issue explicitly before returning the plan.',
     );
   }
-  // Platform hint for planner – tells LLM which shell syntax to use.
   const platform = process.platform;
   const osHint = platform === 'win32' ? 'Windows (use PowerShell commands)' : `${platform} (use Bash commands)`;
   lines.push('', `Host OS: ${osHint}. Emit shell commands using the native syntax.`);
@@ -69,8 +68,8 @@ function buildMissionPlanPrompt(goal, context, { emphasis = 'standard', failureR
     '3. Provide 2-6 highly specialized agents tailored to the mission.',
     '4. Agents must be complementary and cover the full delivery loop (planning/design, implementation, testing/QA, validation/documentation) unless the mission explicitly omits a phase.',
     '5. Do not assign multiple agents to the same task; instead, create sequential hand-offs that mirror a real engineering team.',
-    '6. Every agent must describe only actions they genuinely perform (commands run, files touched, tests executed). Fabricated or purely hypothetical work is forbidden—agents must verify artifacts before reporting success.',
-    '7. The planner MUST NOT write code, shell commands, or pseudo-implementations. Its sole responsibility is to emit JSON that describes the mission summary and agent plan—no Markdown, code blocks, or instructions beyond the schema.',
+    '6. Every agent must describe only actions they genuinely perform (commands run, files touched, tests executed). Fabricated work is forbidden.',
+    '7. The planner MUST NOT write code, shell commands, or pseudo-implementations. It must emit JSON only.',
     '',
     'JSON schema sample:',
     '{"mission_summary":"...","agents":[{"name":"...","role":"...","expertise":"...","objective":"...","instructions":"..."}]}',
@@ -113,15 +112,15 @@ function buildAgentPrompt(mission, agent, { attempt = 0, failureReason = null } 
 `
       : '';
   const realityBlock = `Reality-check requirement:
-- Only describe actions you actually performed during this turn (commands executed, files created/edited, tests run). Do NOT speculate or invent results.
-- After each modification, cite the exact command used (e.g., \`ls\`, \`cat file\`, \`npm test --timeout 60\`) and summarize the observed output, or explicitly state why the action could not be performed.
+- Only describe actions you actually performed during this turn (commands executed, files created/edited, tests run). Do NOT speculate.
+- After each modification, cite the exact command used and summarize the observed output, or explicitly state why the action could not be performed.
 - If a requested artifact does not exist or you lack permissions/resources, declare the blocker and request an iteration instead of fabricating work.
 
 `;
   const timeoutBlock = needsTimeoutDirective(agent)
     ? `Testing safety requirement:
-- Every command, script, or test you run MUST include an explicit, realistic timeout. Choose a duration appropriate for the workload (typically 30-180 seconds). If the tool lacks a timeout flag, wrap it with a timeout utility (e.g., PowerShell Start-Process with -Wait -Timeout, bash "timeout" command, or equivalent).
-- Never run commands without timeouts; if a tool cannot be wrapped, describe the limitation and request guidance before proceeding.
+- Every command, script, or test you run MUST include an explicit, realistic timeout. If the tool lacks a timeout flag, wrap it with an appropriate timeout utility.
+- If a tool cannot be wrapped, describe the limitation and request guidance before proceeding.
 
 `
     : '';
@@ -215,9 +214,7 @@ export class Orchestrator extends EventEmitter {
 
     for (let attemptIndex = 0; attemptIndex < MAX_PLAN_ATTEMPTS; attemptIndex += 1) {
       const emphasis = attemptIndex === 0 ? 'standard' : 'retry';
-      if (attemptIndex > 0) {
-        await this.runner.ensureInactive();
-      }
+// keep planning in the same Codex thread for continuity
       const prompt = buildMissionPlanPrompt(mission.goal, mission.context, {
         emphasis,
         failureReason,
@@ -260,7 +257,12 @@ export class Orchestrator extends EventEmitter {
     mission.logs.push({ type: `plan:${label}:prompt`, at: new Date().toISOString(), prompt });
     debugLog(`Plan prompt (${label})`, { prompt: prompt.slice(0, 400) });
 
-    const planResult = await this.runner.runOnce({ prompt, extraArgs: [] });
+    const planResult = await this.runner.runOnce({
+      prompt,
+      extraArgs: [],
+      threadId: mission.planSessionId ?? undefined,
+      sessionId: mission.planSessionId ?? undefined,
+    });
 
     mission.logs.push({
       type: `plan:${label}:raw`,
@@ -274,6 +276,8 @@ export class Orchestrator extends EventEmitter {
       stdoutPreview: planResult.stdout?.slice(0, 400),
     });
 
+    mission.planSessionId =
+      planResult.sessionId ?? planResult.threadId ?? mission.planSessionId ?? null;
     const { plan, preview } = this.#parsePlanCandidates(mission, planResult, label);
     return { plan, preview, planResult };
   }
@@ -348,6 +352,28 @@ export class Orchestrator extends EventEmitter {
     return `Planner response was not valid JSON. Preview: ${preview.slice(0, 200)}`;
   }
 
+  #composeFailureReason(prefix, result) {
+    const exitCodeText = result.exitCode === null ? 'no exit code' : String(result.exitCode);
+    const stderr = (result.stderr ?? '').toString();
+    const stdout = (result.stdout ?? '').toString();
+    const eventFlags = [];
+    if (Array.isArray(result.events)) {
+      for (const e of result.events) {
+        if (e?.type === 'error' || e?.type === 'exception') eventFlags.push(e.type);
+        if (e?.status && e.status !== 'success') eventFlags.push(`status:${e.status}`);
+        if (e?.item?.status && e.item.status !== 'success') eventFlags.push(`itemStatus:${e.item.status}`);
+      }
+    }
+    const parts = [
+      prefix,
+      `exit=${exitCodeText}`,
+      stderr ? `stderr=${stderr.slice(0, 200)}` : null,
+      stdout ? `stdout=${stdout.slice(0, 200)}` : null,
+      eventFlags.length ? `event_flags=${eventFlags.join(',')}` : null,
+    ].filter(Boolean);
+    return parts.join(' • ');
+  }
+
   #applyPlanResult(mission, parsed, planResult) {
     mission.summary = parsed.mission_summary ?? parsed.summary ?? null;
     mission.agentBlueprints = mission.agentBlueprints ?? Object.create(null);
@@ -387,14 +413,10 @@ export class Orchestrator extends EventEmitter {
 
     for (let idx = 0; idx < mission.agents.length; idx += 1) {
       const agent = mission.agents[idx];
-      if (agent.status === 'completed') {
-        continue;
-      }
+      if (agent.status === 'completed') continue;
 
       agent.status = 'running';
-      if (!agent.startedAt) {
-        agent.startedAt = new Date().toISOString();
-      }
+      if (!agent.startedAt) agent.startedAt = new Date().toISOString();
       this.emit('agent:started', { missionId: mission.id, agent });
 
       let attemptIndex = 0;
@@ -404,9 +426,7 @@ export class Orchestrator extends EventEmitter {
       let lastResult = null;
 
       while (attemptIndex < MAX_AGENT_ATTEMPTS) {
-        if (attemptIndex > 0) {
-          await this.runner.ensureInactive();
-        }
+// stay in the same thread for this agent so context accumulates
         const agentPrompt = buildAgentPrompt(mission, agent, {
           attempt: attemptIndex,
           failureReason,
@@ -416,6 +436,8 @@ export class Orchestrator extends EventEmitter {
           result = await this.runner.runOnce({
             prompt: agentPrompt,
             extraArgs: [],
+            threadId: agent.sessionId ?? undefined,
+            sessionId: agent.sessionId ?? undefined,
           });
         } catch (error) {
           failureReason = `Codex runner error: ${error.message}`;
@@ -424,10 +446,21 @@ export class Orchestrator extends EventEmitter {
             at: new Date().toISOString(),
             data: { error: error.message },
           });
+          // Try auto-triage with sub-agent on thrown errors as well
+          const triageInserted = await this.#tryAutoTriage(mission, agent, idx, {
+            reason: failureReason,
+            result: null,
+          });
+          if (triageInserted > 0) {
+            success = true;
+            break;
+          }
           attemptIndex += 1;
           continue;
         }
         lastResult = result;
+        // persist the thread id for subsequent turns, even on failures
+        agent.sessionId = result?.sessionId ?? result?.threadId ?? agent.sessionId;
 
         agent.logs.push({
           type: 'interaction',
@@ -435,25 +468,60 @@ export class Orchestrator extends EventEmitter {
           data: result,
         });
 
-        if (result.exitCode !== 0) {
-          failureReason = this.#composeFailureReason(
-            `Codex exited with code ${result.exitCode}`,
+        // Non-zero exit or null exit often indicates shell/runtime problems
+        if (result.exitCode === null || result.exitCode !== 0) {
+          const composed = this.#composeFailureReason(
+            `Codex exited with code ${result.exitCode === null ? 'null' : result.exitCode}`,
             result,
           );
+
+          // Windows-specific hint if bash is missing
+          if (composed.toLowerCase().includes('bash') && composed.toLowerCase().includes('no such file or directory') && process.platform === 'win32') {
+            if (!agent.instructions.includes('Use PowerShell')) {
+              agent.instructions += '\nUse PowerShell instead of bash.';
+            }
+          }
+
+          // Try auto-triage via sub-agent to produce a CONTROL_JSON directive
+          const triageInserted = await this.#tryAutoTriage(mission, agent, idx, {
+            reason: composed,
+            result,
+          });
+          if (triageInserted > 0) {
+            success = true;
+            break;
+          }
+
           attemptIndex += 1;
           continue;
         }
 
+        // Parse CONTROL_JSON from the agent message or stdout
         const directiveSource =
           result.lastAgentMessage ?? agent.result?.summary ?? result.stdout ?? '';
-        const controlDirective = this.#extractControlDirective(directiveSource);
-        if (!controlDirective) {
-          failureReason = 'CONTROL_JSON directive missing or invalid';
+        let controlDirective = this.#extractControlDirective(directiveSource);
+
+        const hadExecutionErrors = this.#resultHasExecutionErrors(result);
+
+        // If missing or execution errors detected, attempt auto-triage
+        if (!controlDirective || hadExecutionErrors) {
+          const composed = hadExecutionErrors
+            ? this.#composeFailureReason('Execution anomalies detected', result)
+            : 'CONTROL_JSON directive missing or invalid';
+          const triageInserted = await this.#tryAutoTriage(mission, agent, idx, {
+            reason: composed,
+            result,
+          });
+          if (triageInserted > 0) {
+            success = true;
+            break;
+          }
+          failureReason = composed;
           attemptIndex += 1;
           continue;
         }
 
-        const hadExecutionErrors = this.#resultHasExecutionErrors(result);
+        // Handle a valid CONTROL_JSON
         const directiveOutcome = this.#handleControlDirective(
           mission,
           agent,
@@ -461,6 +529,7 @@ export class Orchestrator extends EventEmitter {
           idx,
           { hadExecutionErrors },
         );
+
         if (!directiveOutcome.ok) {
           failureReason = directiveOutcome.reason;
           attemptIndex += 1;
@@ -517,6 +586,7 @@ export class Orchestrator extends EventEmitter {
         continue;
       }
     }
+    // Nothing to clean because temp sub-agent does not persist in mission.agents
   }
 
   #extractControlDirective(message) {
@@ -526,6 +596,11 @@ export class Orchestrator extends EventEmitter {
     const marker = 'CONTROL_JSON:';
     const markerIndex = message.lastIndexOf(marker);
     if (markerIndex === -1) {
+      // try raw JSON as a fallback
+      const parsed = safeJsonParse(message);
+      if (parsed && typeof parsed === 'object' && (parsed.action || parsed.status)) {
+        return parsed;
+      }
       return null;
     }
     const jsonCandidate = message.slice(markerIndex + marker.length).trim();
@@ -549,20 +624,29 @@ export class Orchestrator extends EventEmitter {
     if (!action) {
       return { ok: false, inserted: 0, reason: 'CONTROL_JSON missing action' };
     }
+    if (directive.temporary) {
+      // temp directives are handled internally and should not enqueue iterations directly
+      return { ok: true, inserted: 0 };
+    }
     if (action === 'continue') {
       if (hadExecutionErrors) {
-        return { ok: false, inserted: 0, reason: 'Execution errors detected; cannot continue' };
+        const fallback = this.#generateDirectiveFromError(
+          requestingAgent?.result?.summary ?? requestingAgent?.result?.completion ?? '',
+          requestingAgent
+        );
+        if (fallback) {
+          const inserted = this.#enqueueIterationAgents(mission, requestingAgent, fallback, insertIndex);
+          return { ok: true, inserted };
+        }
+        return { ok: false, inserted: 0, reason: 'Execution errors detected' };
       }
       return { ok: true, inserted: 0 };
     }
     if (action === 'request_iteration') {
       const inserted = this.#enqueueIterationAgents(mission, requestingAgent, directive, insertIndex);
-      if (inserted === 0) {
-        return { ok: false, inserted: 0, reason: 'Iteration request could not be fulfilled' };
-      }
       return { ok: true, inserted };
     }
-    return { ok: false, inserted: 0, reason: `Unsupported CONTROL_JSON action: ${action}` };
+    return { ok: false, inserted: 0, reason: `Unknown CONTROL_JSON action: ${action}` };
   }
 
   #enqueueIterationAgents(mission, requestingAgent, directive, insertIndex) {
@@ -648,43 +732,52 @@ export class Orchestrator extends EventEmitter {
     return newAgents.length;
   }
 
-  #composeFailureReason(reason, result) {
-    if (!result) {
-      return reason;
+  #generateDirectiveFromError(errorMessage, agent) {
+    const lower = (errorMessage ?? '').toLowerCase();
+    if (lower.includes('bash') && lower.includes('no such file or directory')) {
+      return {
+        action: 'request_iteration',
+        target_agent: agent.name,
+        instructions: 'Use PowerShell instead of bash.',
+        next_agent: agent.name,
+        reason: 'Missing bash binary',
+      };
     }
-    const stderrSnippet = result.stderr
-      ? result.stderr.replace(/\s+/g, ' ').trim().slice(0, 200)
-      : null;
-    if (stderrSnippet) {
-      return `${reason}. stderr: ${stderrSnippet}`;
+    if (lower.includes('permission denied')) {
+      return {
+        action: 'request_iteration',
+        target_agent: agent.name,
+        instructions: 'Add execute permission to the script or use sudo.',
+        next_agent: agent.name,
+        reason: 'Permission denied',
+      };
     }
-    if (Array.isArray(result.events)) {
-      const errorEvent = result.events.find(
-        (event) =>
-          event?.type === 'error'
-          || event?.type === 'exception'
-          || event?.error
-          || event?.item?.error,
-      );
-      if (errorEvent) {
-        return `${reason}. Event error: ${JSON.stringify(errorEvent).slice(0, 200)}`;
-      }
+    if (lower.includes('command not found')) {
+      return {
+        action: 'request_iteration',
+        target_agent: agent.name,
+        instructions: 'Ensure the command is installed or provide full path.',
+        next_agent: agent.name,
+        reason: 'Command not found',
+      };
     }
-    const stdoutSnippet = result.stdout
-      ? result.stdout.replace(/\s+/g, ' ').trim().slice(0, 200)
-      : null;
-    return stdoutSnippet ? `${reason}. stdout: ${stdoutSnippet}` : reason;
+    if (lower.includes('execvpe')) {
+      return {
+        action: 'request_iteration',
+        target_agent: agent.name,
+        instructions: 'Check that the shell binary exists and is in PATH.',
+        next_agent: agent.name,
+        reason: 'Execvpe error',
+      };
+    }
+    return null;
   }
 
   #resultHasExecutionErrors(result) {
-    if (!result) {
-      return false;
-    }
+    if (!result) return false;
     if (Array.isArray(result.events)) {
       for (const event of result.events) {
-        if (event?.type === 'error' || event?.type === 'exception') {
-          return true;
-        }
+        if (event?.type === 'error' || event?.type === 'exception') return true;
         if (event?.type === 'item.completed') {
           if (
             (event.status && event.status !== 'success')
@@ -698,9 +791,7 @@ export class Orchestrator extends EventEmitter {
       }
     }
     const stderr = `${result.stderr ?? ''}`.toLowerCase();
-    if (!stderr) {
-      return false;
-    }
+    if (!stderr) return false;
     return (
       stderr.includes('error: enoent')
       || stderr.includes('error: eacces')
@@ -710,19 +801,13 @@ export class Orchestrator extends EventEmitter {
   }
 
   #getAgentBlueprint(mission, baseName) {
-    if (!mission.agentBlueprints) {
-      return null;
-    }
-    if (mission.agentBlueprints[baseName]) {
-      return mission.agentBlueprints[baseName];
-    }
+    if (!mission.agentBlueprints) return null;
+    if (mission.agentBlueprints[baseName]) return mission.agentBlueprints[baseName];
     return mission.agentBlueprints[baseName?.replace(/__iter\d+$/, '')] ?? null;
   }
 
   #cloneAgentForIteration(blueprint, mission, { overrideInstructions, triggeredBy, reason } = {}) {
-    if (!blueprint || !mission?.agents) {
-      return null;
-    }
+    if (!blueprint || !mission?.agents) return null;
     const existingCount = mission.agents.filter((agent) => agent.baseName === blueprint.name).length;
     const iterationIndex = existingCount;
     const combinedInstructions =
@@ -748,5 +833,137 @@ export class Orchestrator extends EventEmitter {
       triggeredBy: triggeredBy ?? null,
       iterationReason: reason ?? null,
     };
+  }
+
+  async #tryAutoTriage(mission, agent, insertIndex, context) {
+    // 1) Try simple rule-based directive first
+    const ruleDirective = this.#generateDirectiveFromError(context.reason ?? '', agent);
+    if (ruleDirective) {
+      const inserted = this.#enqueueIterationAgents(mission, agent, ruleDirective, insertIndex);
+      if (inserted > 0) {
+        mission.logs.push({
+          type: 'auto-triage:rule',
+          at: new Date().toISOString(),
+          agent: agent.name,
+          reason: context.reason,
+          directive: ruleDirective,
+        });
+        return inserted;
+      }
+    }
+
+    // 2) Ask a temporary error-analyst sub-agent to emit CONTROL_JSON
+    const directive = await this.#resolveErrorWithSubagent(mission, agent, context);
+    if (directive) {
+      const inserted = this.#enqueueIterationAgents(mission, agent, directive, insertIndex);
+      mission.logs.push({
+        type: 'auto-triage:subagent',
+        at: new Date().toISOString(),
+        agent: agent.name,
+        reason: context.reason,
+        directive,
+      });
+      return inserted;
+    }
+
+    return 0;
+  }
+
+  async #resolveErrorWithSubagent(mission, failedAgent, { reason, result }) {
+    // Build a focused prompt that asks for a CONTROL_JSON line only
+    const stdout = (result?.stdout ?? '').toString();
+    const stderr = (result?.stderr ?? '').toString();
+    const events = Array.isArray(result?.events) ? result.events : [];
+    const exitCode = result?.exitCode;
+
+    const compact = (s, n = 200) => (s ? String(s).slice(0, n) : '');
+    const compactEvents = events.slice(-10).map(e => ({
+      type: e?.type,
+      item: e?.item
+        ? {
+            type: e.item.type,
+            command: compact(e.item.command, 160),
+            status: e.item.status,
+            exit_code: e.item.exit_code,
+          }
+        : undefined,
+    }));
+
+    const evidence = [
+      `Reason: ${reason ?? '[none]'}`,
+      `Exit code: ${exitCode === null ? 'null' : exitCode}`,
+     `STDERR:\n${compact(stderr, 800)}`,
+      `STDOUT:\n${compact(stdout, 800)}`,
+      compactEvents.length ? `Events:\n${JSON.stringify(compactEvents, null, 2)}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
+    const triagePrompt = sanitizePrompt(
+      `You are error_analyst, a specialized troubleshooting sub-agent.
+
+Context:
+- Mission summary: ${mission.summary ?? '(none)'}
+- Failing agent: ${failedAgent.name} (${failedAgent.role})
+- Objective: ${failedAgent.objective}
+
+Observed failure details:
+${evidence}
+
+Task:
+- Produce a single CONTROL_JSON directive to correct the failure.
+- Prefer "request_iteration" with:
+  - target_agent: "${failedAgent.name}"
+  - instructions: a short, actionable fix based on the evidence
+  - next_agent: "${failedAgent.name}" unless a different follow-up is clearly needed
+
+Rules:
+- Do not apologize or add commentary.
+- The FINAL line of your response MUST be exactly:
+CONTROL_JSON: {"action":"request_iteration","target_agent":"...","instructions":"...","next_agent":"..."}
+
+If everything was already correct and the mission should proceed, then the FINAL line MUST be:
+CONTROL_JSON: {"action":"continue"}
+
+Return nothing else.`
+    );
+
+    try {
+      const triageResult = await this.runner.runOnce({
+        prompt: triagePrompt,
+        extraArgs: [],
+        threadId: failedAgent.sessionId ?? undefined,
+        sessionId: failedAgent.sessionId ?? undefined,
+      });
+      // We "kill" the temp sub-agent by not inserting it into mission.agents.
+      const text =
+        triageResult.lastAgentMessage ??
+        triageResult.completion ??
+        triageResult.stdout ??
+        '';
+      const directive = this.#extractControlDirective(String(text));
+      if (directive && typeof directive === 'object') {
+        // Normalize action
+        if (directive.status && !directive.action) {
+          directive.action = directive.status;
+        }
+        // Ensure shape if it is a request_iteration
+        if ((directive.action ?? '').toLowerCase() === 'request_iteration') {
+          if (!directive.target_agent) directive.target_agent = failedAgent.name;
+          if (!directive.next_agent) directive.next_agent = failedAgent.name;
+          if (!directive.instructions || !String(directive.instructions).trim()) {
+            directive.instructions = 'Retry with corrected setup based on error analysis.';
+          }
+        }
+        return directive;
+      }
+      debugLog('Sub-agent triage produced no directive', {
+        preview: String(text).slice(0, 200),
+      });
+      return null;
+    } catch (err) {
+      debugLog('Sub-agent triage error', { error: err?.message });
+      return null;
+    }
   }
 }

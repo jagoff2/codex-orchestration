@@ -5,13 +5,13 @@ const DEFAULT_WORKDIR = process.env.CODEX_WORKDIR || process.cwd();
 
 const profileArg = process.env.CODEX_PROFILE || 'gpt-oss-20b-lms';
 const globalCliArgs = [
+  '--json',
   '--profile',
   profileArg,
   '--dangerously-bypass-approvals-and-sandbox',
 ];
 
 const execCliArgs = [
-  '--json',
   '--skip-git-repo-check',
 ];
 

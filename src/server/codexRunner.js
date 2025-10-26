@@ -79,18 +79,18 @@ export class CodexRunner extends EventEmitter {
   }) {
     const invocationId = uuidv4();
     const args = ['exec'];
+    // Flags must come before "resume"
+    const flags = [...this.execArgs, ...this.globalArgs];
+    if (Array.isArray(extraArgs) && extraArgs.length) {
+      flags.push(...extraArgs);
+    }
+    args.push(...flags);
 
     if (sessionId) {
       args.push('resume', sessionId);
     } else if (resumeLast) {
       args.push('resume', '--last');
     }
-
-    const flagOrder = [...this.execArgs, ...this.globalArgs];
-    if (Array.isArray(extraArgs) && extraArgs.length) {
-      flagOrder.push(...extraArgs);
-    }
-    args.push(...flagOrder);
 
     if (prompt) {
       const sanitizedPrompt = sanitizePrompt(prompt);
