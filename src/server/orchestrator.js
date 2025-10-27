@@ -501,7 +501,7 @@ export class Orchestrator extends EventEmitter {
           result.lastAgentMessage ?? agent.result?.summary ?? result.stdout ?? '';
         let controlDirective = this.#extractControlDirective(directiveSource);
 
-        const hadExecutionErrors = this.#resultHasExecutionErrors(result);
+        const hadExecutionErrors = this.#resultHasExecutionErrors(result, controlDirective);
 
         // If missing or execution errors detected, attempt auto-triage
         if (!controlDirective || hadExecutionErrors) {
@@ -773,7 +773,7 @@ export class Orchestrator extends EventEmitter {
     return null;
   }
 
-  #resultHasExecutionErrors(result) {
+  #resultHasExecutionErrors(result, controlDirective = null) {
     if (!result) return false;
     if (Array.isArray(result.events)) {
       for (const event of result.events) {
