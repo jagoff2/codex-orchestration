@@ -92,10 +92,12 @@ export class CodexRunner extends EventEmitter {
       args.push('resume', '--last');
     }
 
+    let promptPayload = null;
     if (prompt) {
       const sanitizedPrompt = sanitizePrompt(prompt);
       debugLog('Runner prompt length', sanitizedPrompt.length);
-      args.push(sanitizedPrompt);
+      promptPayload = sanitizedPrompt;
+      args.push('-');
     }
     if (command) {
       args.push(command);
@@ -114,6 +116,13 @@ export class CodexRunner extends EventEmitter {
       input: child.stdout,
       crlfDelay: Infinity,
     });
+
+    if (promptPayload !== null && child.stdin) {
+      child.stdin.write(promptPayload);
+      child.stdin.end();
+    } else if (child.stdin && !child.stdin.closed) {
+      child.stdin.end();
+    }
 
     const result = {
       invocationId,

@@ -7,6 +7,8 @@ import { sanitizePrompt } from '../promptUtils.js';
 
 const MAX_PLAN_ATTEMPTS = Number(process.env.CODEX_ORCHESTRATOR_MAX_PLAN_ATTEMPTS ?? 4);
 const MAX_AGENT_ATTEMPTS = Number(process.env.CODEX_ORCHESTRATOR_MAX_AGENT_ATTEMPTS ?? 3);
+const TIMELINE_HISTORY_LIMIT = Number(process.env.CODEX_ORCHESTRATOR_TIMELINE_LIMIT ?? 12);
+const TIMELINE_PROMPT_WINDOW = Number(process.env.CODEX_ORCHESTRATOR_TIMELINE_PROMPT_WINDOW ?? 6);
 
 function safeJsonParse(payload) {
   if (!payload || typeof payload !== 'string') return null;
@@ -101,6 +103,26 @@ function needsTimeoutDirective(agent) {
   );
 }
 
+function renderMissionTimelineForPrompt(mission, windowSize = TIMELINE_PROMPT_WINDOW) {
+  if (!mission?.timeline || mission.timeline.length === 0) {
+    return null;
+  }
+  const limit = Math.max(1, windowSize);
+  const entries = mission.timeline.slice(-limit);
+  const formatted = entries
+    .map((entry) => {
+      if (!entry || typeof entry.promptLine !== 'string') {
+        return null;
+      }
+      return entry.promptLine;
+    })
+    .filter(Boolean);
+  if (formatted.length === 0) {
+    return null;
+  }
+  return formatted.join(' || ');
+}
+
 function buildAgentPrompt(mission, agent, { attempt = 0, failureReason = null } = {}) {
   const retryBlock =
     failureReason && `${failureReason}`.trim().length
@@ -124,9 +146,15 @@ function buildAgentPrompt(mission, agent, { attempt = 0, failureReason = null } 
 
 `
     : '';
+  const timelineRecap = renderMissionTimelineForPrompt(mission);
+  const timelineSection = timelineRecap
+    ? `Mission timeline recap (most recent last): ${timelineRecap}
+
+`
+    : '';
   const rawPrompt = `You are ${agent.name}, ${agent.role}.
 Mission summary: ${mission.summary}
-Your objective: ${agent.objective}
+${timelineSection}Your objective: ${agent.objective}
 Core expertise: ${agent.expertise}
 
 Instructions:
@@ -150,6 +178,34 @@ export class Orchestrator extends EventEmitter {
     super();
     this.runner = new CodexRunner(options);
     this.missions = new Map();
+  }
+
+  // ----- Cleanup helpers -----
+  async #cleanupSession(sessionId) {
+    // Ensure any lingering child process is terminated.
+    try {
+      await this.runner.ensureInactive();
+    } catch (e) {
+      debugLog('cleanup error', e);
+    }
+  }
+
+  async #runOnceAndCleanup(opts) {
+    // Run a Codex command and ensure the child process is terminated afterwards,
+    // even if the command throws an error. This prevents orphaned threads from
+    // persisting when we switch contexts (e.g., moving between planning,
+    // agent execution, or error‑analyst sub‑agent).
+    let sessionId = opts.sessionId;
+    let result;
+    try {
+      result = await this.runner.runOnce(opts);
+      // Prefer the session ID returned by the runner if available.
+      sessionId = result?.sessionId ?? result?.threadId ?? sessionId;
+      return result;
+    } finally {
+      // Ensure any lingering child process is killed.
+      await this.#cleanupSession(sessionId);
+    }
   }
 
   listMissions() {
@@ -186,6 +242,7 @@ export class Orchestrator extends EventEmitter {
       summary: null,
       results: [],
       agentBlueprints: Object.create(null),
+      timeline: [],
     };
 
     this.missions.set(missionId, mission);
@@ -257,7 +314,7 @@ export class Orchestrator extends EventEmitter {
     mission.logs.push({ type: `plan:${label}:prompt`, at: new Date().toISOString(), prompt });
     debugLog(`Plan prompt (${label})`, { prompt: prompt.slice(0, 400) });
 
-    const planResult = await this.runner.runOnce({
+    const planResult = await this.#runOnceAndCleanup({
       prompt,
       extraArgs: [],
       threadId: mission.planSessionId ?? undefined,
@@ -536,19 +593,34 @@ export class Orchestrator extends EventEmitter {
           continue;
         }
 
+        const effectiveDirective = directiveOutcome.directive ?? controlDirective ?? null;
+        const cleanedSummaryRaw = this.#stripControlDirectiveFromMessage(
+          result.lastAgentMessage ?? '',
+        );
+        const summaryText =
+          cleanedSummaryRaw && cleanedSummaryRaw.length
+            ? cleanedSummaryRaw
+            : result.lastAgentMessage ?? null;
+
         agent.completedAt = new Date().toISOString();
         agent.sessionId = result.sessionId ?? result.threadId ?? null;
         agent.result = {
-          summary: result.lastAgentMessage ?? null,
+          summary: summaryText,
           usage: result.usage ?? null,
           completion: result.completion,
           command: result.command ?? null,
+          controlDirective: effectiveDirective ?? null,
         };
         agent.status = 'completed';
         mission.results.push({
           agentId: agent.id,
           output: agent.result,
+          controlDirective: effectiveDirective ?? null,
         });
+        const reviewEntry = this.#recordAgentReview(mission, agent, effectiveDirective, result);
+        if (reviewEntry) {
+          agent.result.review = reviewEntry;
+        }
         mission.updatedAt = new Date().toISOString();
         this.emit('agent:finished', { missionId: mission.id, agent });
 
@@ -618,15 +690,20 @@ export class Orchestrator extends EventEmitter {
   #handleControlDirective(mission, requestingAgent, directive, insertIndex, options = {}) {
     const { hadExecutionErrors = false } = options;
     if (!directive || typeof directive !== 'object') {
-      return { ok: false, inserted: 0, reason: 'Malformed CONTROL_JSON directive' };
+      return { ok: false, inserted: 0, reason: 'Malformed CONTROL_JSON directive', directive: null };
     }
     const action = `${directive.action ?? directive.status ?? ''}`.toLowerCase();
     if (!action) {
-      return { ok: false, inserted: 0, reason: 'CONTROL_JSON missing action' };
+      return {
+        ok: false,
+        inserted: 0,
+        reason: 'CONTROL_JSON missing action',
+        directive: null,
+      };
     }
     if (directive.temporary) {
       // temp directives are handled internally and should not enqueue iterations directly
-      return { ok: true, inserted: 0 };
+      return { ok: true, inserted: 0, directive };
     }
     if (action === 'continue') {
       if (hadExecutionErrors) {
@@ -636,17 +713,139 @@ export class Orchestrator extends EventEmitter {
         );
         if (fallback) {
           const inserted = this.#enqueueIterationAgents(mission, requestingAgent, fallback, insertIndex);
-          return { ok: true, inserted };
+          return { ok: true, inserted, directive: fallback };
         }
-        return { ok: false, inserted: 0, reason: 'Execution errors detected' };
+        return {
+          ok: false,
+          inserted: 0,
+          reason: 'Execution errors detected',
+          directive: null,
+        };
       }
-      return { ok: true, inserted: 0 };
+      return { ok: true, inserted: 0, directive };
     }
     if (action === 'request_iteration') {
       const inserted = this.#enqueueIterationAgents(mission, requestingAgent, directive, insertIndex);
-      return { ok: true, inserted };
+      return { ok: true, inserted, directive };
     }
-    return { ok: false, inserted: 0, reason: `Unknown CONTROL_JSON action: ${action}` };
+    return {
+      ok: false,
+      inserted: 0,
+      reason: `Unknown CONTROL_JSON action: ${action}`,
+      directive: null,
+    };
+  }
+
+  #stripControlDirectiveFromMessage(message) {
+    if (!message || typeof message !== 'string') {
+      return '';
+    }
+    const marker = 'CONTROL_JSON:';
+    const markerIndex = message.lastIndexOf(marker);
+    if (markerIndex === -1) {
+      return message.trim();
+    }
+    return message.slice(0, markerIndex).trim();
+  }
+
+  #normalizeWhitespace(value) {
+    if (!value) return '';
+    return `${value}`.replace(/\s+/g, ' ').trim();
+  }
+
+  #truncateText(value, maxLength = 240) {
+    if (!value) return '';
+    const normalized = this.#normalizeWhitespace(value);
+    if (normalized.length <= maxLength) {
+      return normalized;
+    }
+    return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
+  }
+
+  #summarizeDirectiveForTimeline(directive) {
+    if (!directive || typeof directive !== 'object') {
+      return null;
+    }
+    const action = directive.action ?? directive.status ?? 'unspecified';
+    const parts = [`action=${action}`];
+    const target =
+      directive.target_agent ?? directive.targetAgent ?? directive.target ?? null;
+    if (target) {
+      parts.push(`target=${target}`);
+    }
+    const nextAgent =
+      directive.next_agent ?? directive.nextAgent ?? directive.follow_up_agent ?? null;
+    if (nextAgent) {
+      parts.push(`next=${nextAgent}`);
+    }
+    const reason = directive.reason ?? directive.summary ?? null;
+    if (reason) {
+      parts.push(`reason=${this.#truncateText(reason, 120)}`);
+    }
+    const instructions =
+      directive.instructions
+      ?? directive.updated_instructions
+      ?? directive.details
+      ?? directive.fix
+      ?? null;
+    if (instructions) {
+      parts.push(`instructions=${this.#truncateText(instructions, 160)}`);
+    }
+    return parts.join(' ');
+  }
+
+  #composeTimelineLine(entry) {
+    if (!entry) return '';
+    const iterationLabel = `iter${entry.iteration ?? 0}`;
+    const timestamp = entry.completedAt
+      ? entry.completedAt.slice(0, 19)
+      : new Date().toISOString().slice(0, 19);
+    const parts = [
+      `${entry.agentName ?? 'agent'}(${iterationLabel})`,
+      entry.summaryPreview ? `result=${entry.summaryPreview}` : null,
+      entry.controlSummary ? `control=${entry.controlSummary}` : null,
+    ].filter(Boolean);
+    return [timestamp, ...parts].join(' | ');
+  }
+
+  #recordAgentReview(mission, agent, directive, result) {
+    if (!mission) return null;
+    if (!mission.timeline) {
+      mission.timeline = [];
+    }
+    const summarySource =
+      agent?.result?.summary
+      ?? this.#stripControlDirectiveFromMessage(result?.lastAgentMessage ?? '')
+      ?? null;
+    const summaryPreview = summarySource
+      ? this.#truncateText(summarySource, 320)
+      : 'No summary provided';
+    const controlSummary = this.#summarizeDirectiveForTimeline(directive);
+    const completedAt = new Date().toISOString();
+    const entry = {
+      agentId: agent?.id ?? null,
+      agentName: agent?.name ?? agent?.baseName ?? 'unknown_agent',
+      iteration: agent?.iteration ?? 0,
+      completedAt,
+      summary: summarySource ?? null,
+      summaryPreview,
+      controlDirective: directive ?? null,
+      controlSummary,
+    };
+    entry.promptLine = this.#composeTimelineLine(entry);
+    mission.timeline.push(entry);
+    if (mission.timeline.length > TIMELINE_HISTORY_LIMIT) {
+      mission.timeline.splice(0, mission.timeline.length - TIMELINE_HISTORY_LIMIT);
+    }
+    mission.logs.push({
+      type: 'agent:review',
+      at: completedAt,
+      agent: entry.agentName,
+      iteration: entry.iteration,
+      summary: entry.summaryPreview,
+      controlDirective: directive ?? null,
+    });
+    return entry;
   }
 
   #enqueueIterationAgents(mission, requestingAgent, directive, insertIndex) {
